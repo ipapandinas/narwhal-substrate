@@ -6584,7 +6584,6 @@ dependencies = [
 name = "minimal-template-runtime"
 version = "0.1.0"
 dependencies = [
- "pallet-minimal-template",
  "parity-scale-codec",
  "polkadot-sdk",
  "scale-info",
@@ -8258,15 +8257,6 @@ dependencies = [
  "scale-info",
  "sp-core",
  "sp-runtime",
-]
-
-[[package]]
-name = "pallet-minimal-template"
-version = "0.1.0"
-dependencies = [
- "parity-scale-codec",
- "polkadot-sdk",
- "scale-info",
 ]
 
 [[package]]
