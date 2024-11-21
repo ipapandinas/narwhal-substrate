@@ -17,24 +17,18 @@
 
 use polkadot_sdk::{sc_cli::RunCmd, *};
 
-#[derive(Debug, Clone)]
-pub enum Consensus {
-    ManualSeal(u64),
-    InstantSeal,
-}
+#[derive(Debug, Clone, clap::Args)]
+pub struct NarwhalParams {
+    #[arg(long)]
+    pub n_keys: String,
 
-impl std::str::FromStr for Consensus {
-    type Err = String;
+    #[arg(long)]
+    pub n_committee: String,
 
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(if s == "instant-seal" {
-            Consensus::InstantSeal
-        } else if let Some(block_time) = s.strip_prefix("manual-seal-") {
-            Consensus::ManualSeal(block_time.parse().map_err(|_| "invalid block time")?)
-        } else {
-            return Err("incorrect consensus identifier".into());
-        })
-    }
+    // #[arg(long)]
+    // pub n_parameters: String,
+    #[arg(long)]
+    pub n_store: String,
 }
 
 #[derive(Debug, clap::Parser)]
@@ -42,8 +36,9 @@ pub struct Cli {
     #[command(subcommand)]
     pub subcommand: Option<Subcommand>,
 
-    #[clap(long, default_value = "manual-seal-3000")]
-    pub consensus: Consensus,
+    #[allow(missing_docs)]
+    #[clap(flatten)]
+    pub narwhal_params: NarwhalParams,
 
     #[clap(flatten)]
     pub run: RunCmd,

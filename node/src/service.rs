@@ -28,7 +28,7 @@ use polkadot_sdk::{
 };
 use std::sync::Arc;
 
-use crate::cli::Consensus;
+use crate::cli::NarwhalParams;
 
 type HostFunctions = sp_io::SubstrateHostFunctions;
 
@@ -109,7 +109,7 @@ pub fn new_partial(config: &Configuration) -> Result<Service, ServiceError> {
 /// Builds a new service for a full client.
 pub fn new_full<Network: sc_network::NetworkBackend<Block, <Block as BlockT>::Hash>>(
     config: Configuration,
-    consensus: Consensus,
+    NarwhalParams {n_keys, n_committee, n_store}: NarwhalParams,
 ) -> Result<TaskManager, ServiceError> {
     let sc_service::PartialComponents {
         client,
@@ -117,9 +117,9 @@ pub fn new_full<Network: sc_network::NetworkBackend<Block, <Block as BlockT>::Ha
         mut task_manager,
         import_queue,
         keystore_container,
-        select_chain,
         transaction_pool,
         other: mut telemetry,
+        ..
     } = new_partial(&config)?;
 
     let net_config = sc_network::config::FullNetworkConfiguration::<
@@ -185,8 +185,6 @@ pub fn new_full<Network: sc_network::NetworkBackend<Block, <Block as BlockT>::Ha
         })
     };
 
-    let prometheus_registry = config.prometheus_registry().cloned();
-
     let _rpc_handlers = sc_service::spawn_tasks(sc_service::SpawnTasksParams {
         network,
         client: client.clone(),
@@ -202,75 +200,11 @@ pub fn new_full<Network: sc_network::NetworkBackend<Block, <Block as BlockT>::Ha
         telemetry: telemetry.as_mut(),
     })?;
 
-    let proposer = sc_basic_authorship::ProposerFactory::new(
-        task_manager.spawn_handle(),
-        client.clone(),
-        transaction_pool.clone(),
-        prometheus_registry.as_ref(),
-        telemetry.as_ref().map(|x| x.handle()),
+    task_manager.spawn_essential_handle().spawn_blocking(
+        "narwhal",
+        None,
+        narwhal_consensus::start_narwhal(n_keys, n_committee, n_store),
     );
-
-    match consensus {
-        Consensus::InstantSeal => {
-            let params = sc_consensus_manual_seal::InstantSealParams {
-                block_import: client.clone(),
-                env: proposer,
-                client,
-                pool: transaction_pool,
-                select_chain,
-                consensus_data_provider: None,
-                create_inherent_data_providers: move |_, ()| async move {
-                    Ok(sp_timestamp::InherentDataProvider::from_system_time())
-                },
-            };
-
-            let authorship_future = sc_consensus_manual_seal::run_instant_seal(params);
-
-            task_manager.spawn_essential_handle().spawn_blocking(
-                "instant-seal",
-                None,
-                authorship_future,
-            );
-        }
-        Consensus::ManualSeal(block_time) => {
-            let (mut sink, commands_stream) = futures::channel::mpsc::channel(1024);
-            task_manager
-                .spawn_handle()
-                .spawn("block_authoring", None, async move {
-                    loop {
-                        futures_timer::Delay::new(std::time::Duration::from_millis(block_time))
-                            .await;
-                        sink.try_send(sc_consensus_manual_seal::EngineCommand::SealNewBlock {
-                            create_empty: true,
-                            finalize: true,
-                            parent_hash: None,
-                            sender: None,
-                        })
-                        .unwrap();
-                    }
-                });
-
-            let params = sc_consensus_manual_seal::ManualSealParams {
-                block_import: client.clone(),
-                env: proposer,
-                client,
-                pool: transaction_pool,
-                select_chain,
-                commands_stream: Box::pin(commands_stream),
-                consensus_data_provider: None,
-                create_inherent_data_providers: move |_, ()| async move {
-                    Ok(sp_timestamp::InherentDataProvider::from_system_time())
-                },
-            };
-            let authorship_future = sc_consensus_manual_seal::run_manual_seal(params);
-
-            task_manager.spawn_essential_handle().spawn_blocking(
-                "manual-seal",
-                None,
-                authorship_future,
-            );
-        }
-    }
 
     network_starter.start_network();
     Ok(task_manager)
