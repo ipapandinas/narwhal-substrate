@@ -109,7 +109,11 @@ pub fn new_partial(config: &Configuration) -> Result<Service, ServiceError> {
 /// Builds a new service for a full client.
 pub fn new_full<Network: sc_network::NetworkBackend<Block, <Block as BlockT>::Hash>>(
     config: Configuration,
-    NarwhalParams {n_keys, n_committee, n_store}: NarwhalParams,
+    NarwhalParams {
+        n_keys,
+        n_committee,
+        n_store,
+    }: NarwhalParams,
 ) -> Result<TaskManager, ServiceError> {
     let sc_service::PartialComponents {
         client,
@@ -200,11 +204,23 @@ pub fn new_full<Network: sc_network::NetworkBackend<Block, <Block as BlockT>::Ha
         telemetry: telemetry.as_mut(),
     })?;
 
-    task_manager.spawn_essential_handle().spawn_blocking(
-        "narwhal",
-        None,
-        narwhal_consensus::start_narwhal(n_keys, n_committee, n_store),
-    );
+    let params = narwhal_consensus::NarwhalParams {
+        pool: transaction_pool,
+        n_keys,
+        n_committee,
+        n_store,
+        _phantom: std::marker::PhantomData,
+    };
+
+    let narwhal_future = async move {
+        if let Err(err) = narwhal_consensus::start_narwhal(params).await {
+            log::error!("Error while starting Narwhal: {:?}", err);
+        }
+    };
+
+    task_manager
+        .spawn_essential_handle()
+        .spawn_blocking("narwhal", None, narwhal_future);
 
     network_starter.start_network();
     Ok(task_manager)
