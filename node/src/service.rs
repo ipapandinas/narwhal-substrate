@@ -206,6 +206,8 @@ pub fn new_full<Network: sc_network::NetworkBackend<Block, <Block as BlockT>::Ha
 
     let params = narwhal_consensus::NarwhalParams {
         pool: transaction_pool,
+        block_import: client.clone(),
+        client,
         n_keys,
         n_committee,
         n_store,
