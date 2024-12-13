@@ -12,6 +12,7 @@ use polkadot_sdk::sp_inherents::InherentData;
 use polkadot_sdk::sp_runtime::Digest;
 use polkadot_sdk::{
     sc_block_builder::BlockBuilderApi,
+    sc_service::InPoolTransaction,
     sc_transaction_pool_api::{TransactionFor, TransactionPool, TxHash},
     sp_api::{ApiExt, CallApiAt, ProvideRuntimeApi},
     sp_blockchain::{self, HeaderBackend},
@@ -22,7 +23,10 @@ use primary::{Certificate, Primary};
 use std::future::{self, Future};
 use std::marker::PhantomData;
 use std::net::SocketAddr;
-use std::{pin::Pin, sync::Arc};
+use std::{
+    pin::Pin,
+    sync::{Arc, Mutex},
+};
 use store::Store;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc::{channel, Receiver};
@@ -163,6 +167,9 @@ where
     }
 
     async fn seal_block(&self) -> Result<()> {
+        let txns = self.pool.pop_all();
+        log::warn!("Seal block with txns: {:?}", txns);
+        // Remove transaction from substrate_pool if successfully executed and sealed in the block
         Ok(())
     }
 }
@@ -192,14 +199,18 @@ where
     });
 
     // Run Narwhal consensus
-    if let Err(err) = run_narwhal(params.pool, aux_data).await {
+    if let Err(err) = run_narwhal(params.pool, narwhal_pool.clone(), aux_data).await {
         log::error!("Error while running Narwhal: {:?}", err);
     }
 
     Ok(())
 }
 
-pub async fn run_narwhal<B, TP>(substrate_pool: Arc<TP>, aux_data: AuxData) -> Result<()>
+pub async fn run_narwhal<B, TP>(
+    substrate_pool: Arc<TP>,
+    narwhal_pool: Arc<CustomTransactionPool<B, TP>>,
+    aux_data: AuxData,
+) -> Result<()>
 where
     B: BlockT + 'static,
     TP: TransactionPool<Block = B> + 'static,
@@ -256,12 +267,13 @@ where
         );
     }
 
+    let substrate_pool_clone = Arc::clone(&substrate_pool);
     tokio::spawn(async move {
-        let driver = TransactionDriver::new(substrate_pool.clone());
+        let driver = TransactionDriver::new(substrate_pool_clone);
         let _ = driver.run(committee, &keypair_name, &worker_id).await;
     });
 
-    if let Err(err) = process_certificate(store, rx_output).await {
+    if let Err(err) = process_certificate(store, rx_output, substrate_pool, narwhal_pool).await {
         log::error!("Error in process_certificate: {:?}", err);
     }
 
@@ -283,10 +295,16 @@ pub async fn process_transaction(transaction: Vec<u8>, client_addr: SocketAddr) 
 }
 
 // Submits processed transaction extracted from the certificate payload into the custom pool narwhal_pool
-pub async fn process_certificate(
+pub async fn process_certificate<B, TP>(
     mut store: Store,
     mut rx_certificate: Receiver<Certificate>,
-) -> Result<()> {
+    substrate_pool: Arc<TP>,
+    narwhal_pool: Arc<CustomTransactionPool<B, TP>>,
+) -> Result<()>
+where
+    B: BlockT + 'static,
+    TP: TransactionPool<Block = B> + 'static,
+{
     log::warn!("Processing certificates...");
     while let Some(certificate) = rx_certificate.recv().await {
         log::debug!("Certificate: {:?}", certificate);
@@ -304,7 +322,26 @@ pub async fn process_certificate(
                     Ok(worker::worker::WorkerMessage::Batch(batch)) => {
                         log::warn!("BATCH: {:?}", batch);
                         for tx in batch {
-                            println!("DeliverTx'ing: {:?}", tx);
+                            log::warn!("DriveTx'ing - raw tx: {:?}", tx);
+                            // Deserialize tx into TxHash
+                            match serde_json::from_slice::<TxHash<TP>>(&tx) {
+                                Ok(tx_hash) => {
+                                    log::warn!("DriveTx'ing - deserialize tx HASH: {:?}", tx_hash);
+                                    if let Some(certified_tx) =
+                                        substrate_pool.ready_transaction(&tx_hash)
+                                    {
+                                        let tx_data = certified_tx.data().clone();
+                                        log::warn!("DriveTx'ing - tx_data: {:?}", tx_data);
+                                        // Import ordered and certified txn for block sealing
+                                        narwhal_pool.import(tx_data);
+                                    } else {
+                                        log::warn!("Transaction not ready: {:?}", tx);
+                                    }
+                                }
+                                Err(err) => {
+                                    log::error!("Failed to deserialize transaction: {:?}", err);
+                                }
+                            }
                         }
                     }
                     _ => unreachable!(),
@@ -322,26 +359,30 @@ pub async fn process_certificate(
 // CustomTransactionPool
 #[derive(Clone)]
 pub struct CustomTransactionPool<B: BlockT, TP: TransactionPool<Block = B>> {
-    transactions: Vec<TransactionFor<TP>>,
+    pool: Arc<Mutex<Vec<TransactionFor<TP>>>>,
 }
 
 impl<B: BlockT + 'static, TP: TransactionPool<Block = B>> CustomTransactionPool<B, TP> {
     pub fn new() -> Self {
         Self {
-            transactions: Vec::new(),
+            pool: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
-    pub fn import(&mut self, tx: TransactionFor<TP>) {
-        // let mut lock = self.transactions.lock().unwrap();
-        // lock.push(tx)
-        todo!()
+    pub fn import(&self, tx: TransactionFor<TP>) {
+        let mut lock = self
+            .pool
+            .lock()
+            .expect("Failed to acquire lock for the mutex");
+        lock.push(tx);
     }
 
     pub fn pop_all(&self) -> Vec<TransactionFor<TP>> {
-        // let mut lock = self.transactions.lock().unwrap();
-        // std::mem::take(&mut *lock)
-        todo!()
+        let mut lock = self
+            .pool
+            .lock()
+            .expect("Failed to acquire lock for the mutex");
+        std::mem::take(&mut *lock)
     }
 }
 
