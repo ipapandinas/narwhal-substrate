@@ -121,6 +121,7 @@ pub fn new_full<Network: sc_network::NetworkBackend<Block, <Block as BlockT>::Ha
         mut task_manager,
         import_queue,
         keystore_container,
+        select_chain,
         transaction_pool,
         other: mut telemetry,
         ..
@@ -207,6 +208,7 @@ pub fn new_full<Network: sc_network::NetworkBackend<Block, <Block as BlockT>::Ha
     let params = narwhal_consensus::NarwhalParams {
         pool: transaction_pool,
         block_import: client.clone(),
+        select_chain,
         client,
         n_keys,
         n_committee,

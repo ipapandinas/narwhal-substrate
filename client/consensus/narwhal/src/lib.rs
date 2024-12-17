@@ -6,26 +6,32 @@ use consensus::Consensus;
 use crypto::PublicKey;
 use futures::SinkExt;
 use futures::StreamExt;
-use polkadot_sdk::sc_consensus::BlockImport;
-use polkadot_sdk::sp_consensus::Proposal;
-use polkadot_sdk::sp_inherents::InherentData;
-use polkadot_sdk::sp_runtime::Digest;
 use polkadot_sdk::{
-    sc_block_builder::BlockBuilderApi,
+    sc_block_builder::{BlockBuilderApi, BlockBuilderBuilder},
+    sc_consensus::{
+        BlockImport, BlockImportParams, ForkChoiceStrategy, StateAction, StorageChanges,
+    },
     sc_service::InPoolTransaction,
-    sc_transaction_pool_api::{TransactionFor, TransactionPool, TxHash},
+    sc_transaction_pool_api::{TransactionPool, TxHash},
     sp_api::{ApiExt, CallApiAt, ProvideRuntimeApi},
     sp_blockchain::{self, HeaderBackend},
-    sp_consensus::{DisableProofRecording, Environment, Proposer},
-    sp_runtime::traits::{Block as BlockT, Header as HeaderT},
+    sp_consensus::{
+        BlockOrigin, DisableProofRecording, Environment, Proposal, Proposer, SelectChain,
+    },
+    sp_inherents::{CreateInherentDataProviders, InherentData, InherentDataProvider},
+    sp_runtime::{
+        traits::{Block as BlockT, Header as HeaderT},
+        Digest, OpaqueExtrinsic,
+    },
+    sp_timestamp,
 };
 use primary::{Certificate, Primary};
-use std::future::{self, Future};
+use std::future::{self};
 use std::marker::PhantomData;
 use std::net::SocketAddr;
 use std::{
-    pin::Pin,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 use store::Store;
 use tokio::net::TcpStream;
@@ -37,17 +43,28 @@ use worker::Worker;
 
 /// The default channel capacity.
 pub const CHANNEL_CAPACITY: usize = 1_000;
+/// max duration for creating a proposal in secs
+pub const MAX_PROPOSAL_DURATION: u64 = 1;
 
-pub struct NarwhalParams<B: BlockT, TP, C, I>
+pub type LocalTransaction<B> = <B as BlockT>::Extrinsic;
+type CIDP<B> = dyn CreateInherentDataProviders<
+    B,
+    (),
+    InherentDataProviders = sp_timestamp::InherentDataProvider,
+>;
+
+pub struct NarwhalParams<B: BlockT, TP, C, SC, I>
 where
     B: BlockT,
     TP: TransactionPool<Block = B> + 'static,
     C: HeaderBackend<B> + ProvideRuntimeApi<B> + Send + Sync + 'static,
     C::Api: ApiExt<B> + BlockBuilderApi<B>,
+    SC: SelectChain<B> + 'static,
     I: BlockImport<B> + Send + Sync + 'static,
 {
     pub pool: Arc<TP>,
     pub client: Arc<C>,
+    pub select_chain: SC,
     pub block_import: I,
     pub n_keys: String,
     pub n_committee: String,
@@ -120,81 +137,145 @@ where
 }
 
 // Seals new blocks using the custom proposer factory
-pub struct BlockSealer<B, TP, C, I>
+pub struct BlockSealer<B, C, SC, I>
 where
     B: BlockT,
-    TP: TransactionPool<Block = B> + 'static,
     C: HeaderBackend<B> + ProvideRuntimeApi<B> + Send + Sync + 'static,
+    SC: SelectChain<B> + 'static,
     C::Api: ApiExt<B> + BlockBuilderApi<B>,
 {
-    client: Arc<C>,
+    select_chain: SC,
     block_import: I,
-    pool: Arc<CustomTransactionPool<B, TP>>,
-    proposer_factory: Arc<CustomProposerFactory<B, TP, C>>,
+    proposer_factory: CustomProposerFactory<B, C>,
 }
 
-impl<B, TP, C, I> BlockSealer<B, TP, C, I>
+impl<B, C, SC, I> BlockSealer<B, C, SC, I>
 where
-    B: BlockT,
-    TP: TransactionPool<Block = B> + 'static,
-    C: HeaderBackend<B> + ProvideRuntimeApi<B> + Send + Sync + 'static,
+    B: BlockT<Extrinsic = OpaqueExtrinsic>,
+    C: HeaderBackend<B> + ProvideRuntimeApi<B> + CallApiAt<B> + Send + Sync + 'static,
     C::Api: ApiExt<B> + BlockBuilderApi<B>,
+    SC: SelectChain<B> + 'static,
     I: BlockImport<B> + Send + Sync + 'static,
 {
-    pub fn new(client: Arc<C>, block_import: I, pool: Arc<CustomTransactionPool<B, TP>>) -> Self {
-        let proposer_factory = Arc::new(CustomProposerFactory::new(client.clone(), pool.clone()));
+    pub fn new(
+        client: Arc<C>,
+        block_import: I,
+        select_chain: SC,
+        local_pool: Arc<LocalPool>,
+    ) -> Self {
+        let proposer_factory = CustomProposerFactory::new(client.clone(), local_pool.clone());
 
         Self {
-            client,
             block_import,
-            pool,
+            select_chain,
             proposer_factory,
         }
     }
 
-    pub async fn run(&self) -> Result<()> {
+    pub async fn run(
+        &mut self,
+        create_inherent_data_providers: Box<CIDP<B>>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>>
+    where
+        <I as BlockImport<B>>::Error: Sync,
+    {
         log::warn!("Block sealing...");
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
         interval.reset();
 
         loop {
             interval.tick().await;
-            match self.seal_block().await {
+            match self.seal_block(&*create_inherent_data_providers).await {
                 Ok(_) => log::warn!("Block sealed successfully."),
                 Err(err) => log::error!("Error sealing block: {:?}", err),
             }
         }
     }
 
-    async fn seal_block(&self) -> Result<()> {
-        let txns = self.pool.pop_all();
-        log::warn!("Seal block with txns: {:?}", txns);
+    async fn seal_block(
+        &mut self,
+        create_inherent_data_providers: &CIDP<B>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>>
+    where
+        <I as BlockImport<B>>::Error: Sync,
+    {
+        let future = async {
+            let parent = self.select_chain.best_chain().await?;
+
+            let inherent_data_providers = create_inherent_data_providers
+                .create_inherent_data_providers(parent.hash(), ())
+                .await
+                .map_err(|e| anyhow::anyhow!("Error creating inherent data providers: {}", e))?;
+
+            let inherent_data = inherent_data_providers.create_inherent_data().await?;
+            let digest = Digest::default();
+
+            let proposer = self.proposer_factory.init(&parent).await?;
+
+            let proposal = proposer
+                .propose(
+                    inherent_data.clone(),
+                    digest,
+                    Duration::from_secs(MAX_PROPOSAL_DURATION),
+                    None,
+                )
+                .await?;
+
+            let (header, body) = proposal.block.deconstruct();
+            log::warn!("header: {:?}", header);
+            log::warn!("body: {:?}", body);
+
+            let mut params = BlockImportParams::new(BlockOrigin::Own, header.clone());
+            params.body = Some(body);
+            params.finalized = true;
+            params.fork_choice = Some(ForkChoiceStrategy::LongestChain);
+            params.state_action =
+                StateAction::ApplyChanges(StorageChanges::Changes(proposal.storage_changes));
+
+            let res = self.block_import.import_block(params).await?;
+            log::warn!("res: {:?}", res);
+
+            Ok::<(), anyhow::Error>(())
+        };
+
+        if let Err(err) = future.await {
+            log::error!("Error in proposal: {:?}", err);
+        }
+
         // Remove transaction from substrate_pool if successfully executed and sealed in the block
         Ok(())
     }
 }
 
-pub async fn start_narwhal<B, TP, C, I>(params: NarwhalParams<B, TP, C, I>) -> Result<()>
+pub async fn start_narwhal<B, TP, C, SC, I>(params: NarwhalParams<B, TP, C, SC, I>) -> Result<()>
 where
-    B: BlockT + 'static,
+    B: BlockT<Extrinsic = OpaqueExtrinsic> + 'static,
     TP: TransactionPool<Block = B> + 'static,
-    C: HeaderBackend<B> + ProvideRuntimeApi<B> + Send + Sync + 'static,
+    C: HeaderBackend<B> + ProvideRuntimeApi<B> + CallApiAt<B> + Send + Sync + 'static,
     C::Api: ApiExt<B> + BlockBuilderApi<B>,
+    SC: SelectChain<B> + 'static,
     I: BlockImport<B> + Send + Sync + 'static,
+    <I as BlockImport<B>>::Error: Sync,
 {
     log::warn!("Starting Narwhal...");
 
-    let narwhal_pool = Arc::new(CustomTransactionPool::<B, TP>::new());
+    let narwhal_pool = Arc::new(LocalPool::new());
     let aux_data = AuxData::import(params.n_keys, params.n_committee, params.n_store)
         .context("Failed to initialize AuxData used for authoring")?;
 
-    let block_sealer = BlockSealer::new(params.client, params.block_import, narwhal_pool.clone());
+    let mut block_sealer = BlockSealer::new(
+        params.client,
+        params.block_import,
+        params.select_chain,
+        narwhal_pool.clone(),
+    );
 
-    log::warn!("Spawning block sealer task...");
-    // Spawn the block sealing task
+    let create_inherent_data_providers =
+        Box::new(|_, _| async { Ok(sp_timestamp::InherentDataProvider::from_system_time()) });
+
     tokio::spawn(async move {
-        if let Err(err) = block_sealer.run().await {
-            log::error!("Error in block sealing: {:?}", err);
+        if let Err(err) = block_sealer.run(create_inherent_data_providers).await {
+            log::error!("Error in block sealing task: {:?}", err);
         }
     });
 
@@ -208,11 +289,11 @@ where
 
 pub async fn run_narwhal<B, TP>(
     substrate_pool: Arc<TP>,
-    narwhal_pool: Arc<CustomTransactionPool<B, TP>>,
+    narwhal_pool: Arc<LocalPool>,
     aux_data: AuxData,
 ) -> Result<()>
 where
-    B: BlockT + 'static,
+    B: BlockT<Extrinsic = OpaqueExtrinsic> + 'static,
     TP: TransactionPool<Block = B> + 'static,
 {
     // TODO: handle shutdown_signal in a tokio::select!
@@ -221,7 +302,7 @@ where
     // Channels the sequence of certificates.
     let (tx_output, rx_output) = channel(CHANNEL_CAPACITY);
 
-    // Load default parameters if none are specified.
+    // Consensus parameters
     let parameters = Parameters::default();
 
     let AuxData {
@@ -299,10 +380,10 @@ pub async fn process_certificate<B, TP>(
     mut store: Store,
     mut rx_certificate: Receiver<Certificate>,
     substrate_pool: Arc<TP>,
-    narwhal_pool: Arc<CustomTransactionPool<B, TP>>,
+    narwhal_pool: Arc<LocalPool>,
 ) -> Result<()>
 where
-    B: BlockT + 'static,
+    B: BlockT<Extrinsic = OpaqueExtrinsic> + 'static,
     TP: TransactionPool<Block = B> + 'static,
 {
     log::warn!("Processing certificates...");
@@ -358,18 +439,18 @@ where
 
 // CustomTransactionPool
 #[derive(Clone)]
-pub struct CustomTransactionPool<B: BlockT, TP: TransactionPool<Block = B>> {
-    pool: Arc<Mutex<Vec<TransactionFor<TP>>>>,
+pub struct LocalPool {
+    pool: Arc<Mutex<Vec<OpaqueExtrinsic>>>,
 }
 
-impl<B: BlockT + 'static, TP: TransactionPool<Block = B>> CustomTransactionPool<B, TP> {
+impl LocalPool {
     pub fn new() -> Self {
         Self {
             pool: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
-    pub fn import(&self, tx: TransactionFor<TP>) {
+    pub fn import(&self, tx: OpaqueExtrinsic) {
         let mut lock = self
             .pool
             .lock()
@@ -377,7 +458,7 @@ impl<B: BlockT + 'static, TP: TransactionPool<Block = B>> CustomTransactionPool<
         lock.push(tx);
     }
 
-    pub fn pop_all(&self) -> Vec<TransactionFor<TP>> {
+    pub fn pop_all(&self) -> Vec<OpaqueExtrinsic> {
         let mut lock = self
             .pool
             .lock()
@@ -386,132 +467,128 @@ impl<B: BlockT + 'static, TP: TransactionPool<Block = B>> CustomTransactionPool<
     }
 }
 
-// CustomProposerFactory
-
 #[derive(Clone)]
-pub struct CustomProposerFactory<B, TP, C>
+pub struct CustomProposerFactory<B, C>
 where
     B: BlockT,
-    TP: TransactionPool<Block = B> + 'static,
     C: HeaderBackend<B> + ProvideRuntimeApi<B> + Send + Sync + 'static,
     C::Api: ApiExt<B> + BlockBuilderApi<B>,
 {
     client: Arc<C>,
-    custom_transaction_pool: Arc<CustomTransactionPool<B, TP>>,
+    pub transaction_pool: Arc<LocalPool>,
+    pub _phantom: PhantomData<B>,
 }
 
-impl<B, TP, C> CustomProposerFactory<B, TP, C>
+impl<B, C> CustomProposerFactory<B, C>
 where
     B: BlockT,
-    TP: TransactionPool<Block = B> + 'static,
     C: HeaderBackend<B> + ProvideRuntimeApi<B> + Send + Sync + 'static,
     C::Api: ApiExt<B> + BlockBuilderApi<B>,
 {
-    pub fn new(client: Arc<C>, custom_transaction_pool: Arc<CustomTransactionPool<B, TP>>) -> Self {
+    pub fn new(client: Arc<C>, transaction_pool: Arc<LocalPool>) -> Self {
         Self {
             client,
-            custom_transaction_pool,
+            transaction_pool,
+            _phantom: std::marker::PhantomData,
         }
     }
 }
 
-impl<B: BlockT, TP: TransactionPool<Block = B>, C> Environment<B>
-    for CustomProposerFactory<B, TP, C>
+impl<B: BlockT, C> Environment<B> for CustomProposerFactory<B, C>
 where
-    B: BlockT,
-    TP: TransactionPool<Block = B> + Clone + 'static,
-    C: HeaderBackend<B> + ProvideRuntimeApi<B> + CallApiAt<B> + Send + Sync + Clone + 'static,
+    B: BlockT<Extrinsic = OpaqueExtrinsic>,
+    C: HeaderBackend<B> + ProvideRuntimeApi<B> + CallApiAt<B> + Send + Sync + 'static,
     C::Api: ApiExt<B> + BlockBuilderApi<B>,
 {
-    type CreateProposer = future::Ready<Result<CustomProposer<B, TP, C>, sp_blockchain::Error>>;
-    type Proposer = CustomProposer<B, TP, C>;
+    type CreateProposer = future::Ready<Result<CustomProposer<B, C>, sp_blockchain::Error>>;
+    type Proposer = CustomProposer<B, C>;
     type Error = sp_blockchain::Error;
 
     fn init(&mut self, parent_header: &B::Header) -> Self::CreateProposer {
         future::ready(Ok(CustomProposer {
-            factory: self.clone(),
+            client: self.client.clone(),
             parent_hash: parent_header.hash(),
+            parent_number: *parent_header.number(),
+            transaction_pool: self.transaction_pool.clone(),
         }))
     }
 }
 
-// CustomProposer
-
-pub struct CustomProposer<B, TP, C>
+pub struct CustomProposer<B, C>
 where
     B: BlockT,
-    TP: TransactionPool<Block = B> + 'static,
     C: HeaderBackend<B> + ProvideRuntimeApi<B> + CallApiAt<B> + Send + Sync + 'static,
     C::Api: ApiExt<B> + BlockBuilderApi<B>,
 {
-    factory: CustomProposerFactory<B, TP, C>,
+    client: Arc<C>,
     parent_hash: B::Hash,
+    parent_number: <<B as BlockT>::Header as HeaderT>::Number,
+    transaction_pool: Arc<LocalPool>,
 }
 
-impl<B, TP, C> CustomProposer<B, TP, C>
+impl<B, C> CustomProposer<B, C>
 where
-    B: BlockT,
-    TP: TransactionPool<Block = B> + 'static,
+    B: BlockT<Extrinsic = OpaqueExtrinsic>,
     C: HeaderBackend<B> + ProvideRuntimeApi<B> + CallApiAt<B> + Send + Sync + 'static,
     C::Api: ApiExt<B> + BlockBuilderApi<B>,
 {
     fn propose_with(
-        &mut self,
-        _inherent_data: InherentData,
+        self,
+        inherent_data: InherentData,
         _inherent_digests: Digest,
-        // deadline: std::time::Instant,
-        // block_size_limit: Option<usize>,
-    ) -> future::Ready<Result<Proposal<B, ()>, sp_blockchain::Error>> {
-        // let block_builder = BlockBuilderBuilder::new(&*self.factory.client)
-        //     .on_parent_block(self.parent_hash)
-        //     .fetch_parent_block_number(&*self.factory.client)
-        //     .unwrap()
-        //     .with_inherent_digests(pre_digests)
-        //     .build()
-        //     .unwrap();
+    ) -> Result<Proposal<B, ()>, sp_blockchain::Error> {
+        let mut block_builder = BlockBuilderBuilder::new(&*self.client)
+            .on_parent_block(self.parent_hash)
+            .with_parent_block_number(self.parent_number)
+            .build()?;
 
-        // let mut block = match block_builder.build().map_err(|e| e.into()) {
-        //     Ok(b) => b.block,
-        //     Err(e) => return future::ready(Err(e)),
-        // };
+        let inherents = block_builder.create_inherents(inherent_data)?;
 
-        // // mutate the block header according to the mutator.
-        // (self.factory.mutator)(&mut block.header, Stage::PreSeal);
+        for inherent in inherents {
+            match block_builder.push(inherent.clone()) {
+                Ok(()) => log::warn!("Inherent Applied: {:?}", inherent),
+                Err(e) => log::error!("Error applying inherent: {:?} - {:?}", inherent, e),
+            }
+        }
 
-        // future::ready(Ok(Proposal {
-        //     block,
-        //     proof: (),
-        //     storage_changes: Default::default(),
-        // }))
-        todo!();
+        let txns = self.transaction_pool.pop_all();
+
+        for txn in txns {
+            match block_builder.push(txn.clone()) {
+                Ok(()) => log::warn!("Txn Applied: {:?}", txn),
+                Err(e) => log::error!("Error applying txn: {:?} - {:?}", txn, e),
+            }
+        }
+
+        let (block, storage_changes, _proof) = block_builder.build()?.into_inner();
+        Ok(Proposal {
+            block,
+            proof: (),
+            storage_changes,
+        })
     }
 }
 
-impl<B, TP: TransactionPool<Block = B>, C> Proposer<B> for CustomProposer<B, TP, C>
+impl<B, C> Proposer<B> for CustomProposer<B, C>
 where
-    B: BlockT,
-    TP: TransactionPool<Block = B> + 'static,
+    B: BlockT<Extrinsic = OpaqueExtrinsic>,
     C: HeaderBackend<B> + ProvideRuntimeApi<B> + CallApiAt<B> + Send + Sync + 'static,
     C::Api: ApiExt<B> + BlockBuilderApi<B>,
 {
-    type Proposal = Pin<Box<dyn Future<Output = Result<Proposal<B, ()>, Self::Error>> + Send>>;
+    type Proposal = future::Ready<Result<Proposal<B, ()>, Self::Error>>;
     type Error = sp_blockchain::Error;
     type ProofRecording = DisableProofRecording;
     type Proof = ();
 
     fn propose(
         self,
-        _inherent_data: InherentData,
-        _inherent_digests: Digest,
+        inherent_data: InherentData,
+        inherent_digests: Digest,
         _max_duration: std::time::Duration,
         _block_size_limit: Option<usize>,
     ) -> Self::Proposal {
-        // self.propose_with(
-        //     inherent_data,
-        //     inherent_digests,
-        //     // max_duration,
-        //     // block_size_limit,
-        // )
-        todo!()
+        let res = self.propose_with(inherent_data, inherent_digests);
+
+        future::ready(res)
     }
 }
