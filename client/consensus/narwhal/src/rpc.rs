@@ -9,7 +9,7 @@ use polkadot_sdk::{
     sp_runtime::{traits::Block as BlockT, OpaqueExtrinsic},
 };
 
-use crate::{AuxData, ConfigPaths, TransactionDriver};
+use crate::{transaction_driver::TransactionDriver, AuxData, ConfigPaths};
 
 pub enum Error {
     ConfigError,
@@ -54,18 +54,18 @@ where
 {
     async fn execute_transaction(&self, transaction: Bytes) -> RpcResult<()> {
         log::warn!("RPC execute_transaction...");
-        let aux_data = AuxData::import(&self.config).map_err(|e| {
-            ErrorObject::owned(
-                Error::ConfigError.into(),
-                "Failed to initialize AuxData from config for RPC",
-                Some(e.to_string()),
-            )
-        })?;
-
         let uxt: <B as BlockT>::Extrinsic = Decode::decode(&mut &*transaction).map_err(|e| {
             ErrorObject::owned(
                 Error::DecodeError.into(),
                 "Unable to decode transaction received",
+                Some(e.to_string()),
+            )
+        })?;
+
+        let aux_data = AuxData::import(&self.config).map_err(|e| {
+            ErrorObject::owned(
+                Error::ConfigError.into(),
+                "Failed to initialize AuxData from config for RPC",
                 Some(e.to_string()),
             )
         })?;
