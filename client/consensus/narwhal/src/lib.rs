@@ -1,18 +1,14 @@
 use anyhow::{Context, Result};
 use bytes::Bytes;
+use config::Import as _;
 use config::{Committee, KeyPair, Parameters};
-use config::{Import as _, WorkerId};
 use consensus::Consensus;
-use crypto::PublicKey;
 use futures::SinkExt;
-use futures::StreamExt;
 use polkadot_sdk::{
     sc_block_builder::{BlockBuilderApi, BlockBuilderBuilder},
     sc_consensus::{
         BlockImport, BlockImportParams, ForkChoiceStrategy, StateAction, StorageChanges,
     },
-    sc_service::InPoolTransaction,
-    sc_transaction_pool_api::{TransactionPool, TxHash},
     sp_api::{ApiExt, CallApiAt, ProvideRuntimeApi},
     sp_blockchain::{self, HeaderBackend},
     sp_consensus::{
@@ -39,6 +35,8 @@ use tokio::sync::mpsc::{channel, Receiver};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use worker::Worker;
 
+pub mod rpc;
+
 // use minimal_template_node::cli::NarwhalParams;
 
 /// The default channel capacity.
@@ -53,83 +51,77 @@ type CIDP<B> = dyn CreateInherentDataProviders<
     InherentDataProviders = sp_timestamp::InherentDataProvider,
 >;
 
-pub struct NarwhalParams<B: BlockT, TP, C, SC, I>
+pub struct NarwhalParams<B: BlockT, C, SC, I>
 where
     B: BlockT,
-    TP: TransactionPool<Block = B> + 'static,
     C: HeaderBackend<B> + ProvideRuntimeApi<B> + Send + Sync + 'static,
     C::Api: ApiExt<B> + BlockBuilderApi<B>,
     SC: SelectChain<B> + 'static,
     I: BlockImport<B> + Send + Sync + 'static,
 {
-    pub pool: Arc<TP>,
     pub client: Arc<C>,
     pub select_chain: SC,
     pub block_import: I,
-    pub n_keys: String,
-    pub n_committee: String,
-    pub n_store: String,
+    pub config: ConfigPaths,
     pub _phantom: PhantomData<B>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ConfigPaths {
+    pub keypair: String,
+    pub committee: String,
+    pub store: String,
 }
 
 pub struct AuxData {
     keypair: KeyPair,
     committee: Committee,
-    store: Store,
 }
 
 impl AuxData {
-    // Read the committee and node's keypair from file.
-    pub fn import(keypair_path: String, commitee_path: String, store_path: String) -> Result<Self> {
+    // Read the committee, store and node's keypair from file.
+    pub fn import(config: &ConfigPaths) -> Result<Self> {
         let keypair =
-            KeyPair::import(&keypair_path).context("Failed to load the node's keypair")?;
-        let committee = Committee::import(&commitee_path)
+            KeyPair::import(&config.keypair).context("Failed to load the node's keypair")?;
+        let committee = Committee::import(&config.committee)
             .context("Failed to load the committee information")?;
-        let store = Store::new(&store_path).context("Failed to create a store")?;
 
-        Ok(Self {
-            keypair,
-            committee,
-            store,
-        })
+        Ok(Self { keypair, committee })
     }
 }
 
-pub struct TransactionDriver<TP: TransactionPool + 'static> {
-    pub pool: Arc<TP>,
+pub struct TransactionDriver {
+    worker_address: SocketAddr,
 }
 
-impl<TP> TransactionDriver<TP>
-where
-    TP: TransactionPool + 'static,
-{
-    pub fn new(pool: Arc<TP>) -> Self {
-        Self { pool }
-    }
+impl TransactionDriver {
+    pub fn new(aux_data: AuxData) -> Self {
+        let keypair_name = aux_data.keypair.name;
+        let worker_id: u32 = 0; //TODO: make id dynamic from index position in committee json file
 
-    // Consume received txn in the substrate mempool and drive them to consensus worker
-    pub async fn run(
-        &self,
-        committee: Committee,
-        keypair_name: &PublicKey,
-        worker_id: &WorkerId,
-    ) -> Result<()> {
-        let worker_address = committee
-            .worker(keypair_name, worker_id)
+        let worker_address = aux_data
+            .committee
+            .worker(&keypair_name, &worker_id)
             .expect("Our public key or worker id is not in the committee")
             .transactions;
 
-        log::warn!("Driving transactions...");
-        // TODO: handle shutdown_signal in a tokio::select!
-        while let Some(tx) = self.pool.import_notification_stream().next().await {
-            log::warn!("Received tx: {:?}", tx);
-            let serialized_tx: Vec<u8> =
-                serde_json::to_vec(&tx).context("Failed to serialize transaction")?;
+        Self { worker_address }
+    }
 
-            match process_transaction(serialized_tx, worker_address).await {
-                Ok(_) => (),
-                Err(err) => log::error!("Transaction processing failed: {}", err),
-            }
+    pub async fn execute_transaction_impl(&self, transaction: OpaqueExtrinsic) -> Result<()> {
+        // TODO: VERIFY transaction
+        self.submit(transaction, self.worker_address).await
+    }
+
+    // Submit a verified transaction to a consensus worker
+    async fn submit(&self, transaction: OpaqueExtrinsic, client_addr: SocketAddr) -> Result<()> {
+        log::warn!("Submitting transaction...");
+        let serialized_tx: Vec<u8> =
+            serde_json::to_vec(&transaction).context("Failed to serialize transaction")?;
+
+        match process_transaction(serialized_tx, client_addr).await {
+            Ok(_) => (),
+            Err(err) => log::error!("Transaction processing failed: {}", err),
         }
 
         Ok(())
@@ -179,14 +171,14 @@ where
     where
         <I as BlockImport<B>>::Error: Sync,
     {
-        log::warn!("Block sealing...");
+        // log::warn!("Block sealing...");
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
         interval.reset();
 
         loop {
             interval.tick().await;
             match self.seal_block(&*create_inherent_data_providers).await {
-                Ok(_) => log::warn!("Block sealed successfully."),
+                Ok(_) => (),
                 Err(err) => log::error!("Error sealing block: {:?}", err),
             }
         }
@@ -222,8 +214,6 @@ where
                 .await?;
 
             let (header, body) = proposal.block.deconstruct();
-            log::warn!("header: {:?}", header);
-            log::warn!("body: {:?}", body);
 
             let mut params = BlockImportParams::new(BlockOrigin::Own, header.clone());
             params.body = Some(body);
@@ -232,8 +222,8 @@ where
             params.state_action =
                 StateAction::ApplyChanges(StorageChanges::Changes(proposal.storage_changes));
 
-            let res = self.block_import.import_block(params).await?;
-            log::warn!("res: {:?}", res);
+            let _ = self.block_import.import_block(params).await?;
+            // log::warn!("res: {:?}", res);
 
             Ok::<(), anyhow::Error>(())
         };
@@ -242,15 +232,13 @@ where
             log::error!("Error in proposal: {:?}", err);
         }
 
-        // Remove transaction from substrate_pool if successfully executed and sealed in the block
         Ok(())
     }
 }
 
-pub async fn start_narwhal<B, TP, C, SC, I>(params: NarwhalParams<B, TP, C, SC, I>) -> Result<()>
+pub async fn start_narwhal<B, C, SC, I>(params: NarwhalParams<B, C, SC, I>) -> Result<()>
 where
     B: BlockT<Extrinsic = OpaqueExtrinsic> + 'static,
-    TP: TransactionPool<Block = B> + 'static,
     C: HeaderBackend<B> + ProvideRuntimeApi<B> + CallApiAt<B> + Send + Sync + 'static,
     C::Api: ApiExt<B> + BlockBuilderApi<B>,
     SC: SelectChain<B> + 'static,
@@ -260,9 +248,6 @@ where
     log::warn!("Starting Narwhal...");
 
     let narwhal_pool = Arc::new(LocalPool::new());
-    let aux_data = AuxData::import(params.n_keys, params.n_committee, params.n_store)
-        .context("Failed to initialize AuxData used for authoring")?;
-
     let mut block_sealer = BlockSealer::new(
         params.client,
         params.block_import,
@@ -280,22 +265,14 @@ where
     });
 
     // Run Narwhal consensus
-    if let Err(err) = run_narwhal(params.pool, narwhal_pool.clone(), aux_data).await {
+    if let Err(err) = run_narwhal(narwhal_pool.clone(), &params.config).await {
         log::error!("Error while running Narwhal: {:?}", err);
     }
 
     Ok(())
 }
 
-pub async fn run_narwhal<B, TP>(
-    substrate_pool: Arc<TP>,
-    narwhal_pool: Arc<LocalPool>,
-    aux_data: AuxData,
-) -> Result<()>
-where
-    B: BlockT<Extrinsic = OpaqueExtrinsic> + 'static,
-    TP: TransactionPool<Block = B> + 'static,
-{
+pub async fn run_narwhal(narwhal_pool: Arc<LocalPool>, config: &ConfigPaths) -> Result<()> {
     // TODO: handle shutdown_signal in a tokio::select!
     log::warn!("Running Narwhal...");
 
@@ -305,11 +282,9 @@ where
     // Consensus parameters
     let parameters = Parameters::default();
 
-    let AuxData {
-        keypair,
-        committee,
-        store,
-    } = aux_data;
+    let AuxData { keypair, committee } =
+        AuxData::import(config).context("Failed to initialize AuxData used for authoring")?;
+    let store = Store::new(&config.store).context("Failed to create a store")?;
 
     let keypair_name = keypair.name.clone();
     let worker_id: u32 = 0; //TODO: make id dynamic from index position in committee json file
@@ -348,13 +323,7 @@ where
         );
     }
 
-    let substrate_pool_clone = Arc::clone(&substrate_pool);
-    tokio::spawn(async move {
-        let driver = TransactionDriver::new(substrate_pool_clone);
-        let _ = driver.run(committee, &keypair_name, &worker_id).await;
-    });
-
-    if let Err(err) = process_certificate(store, rx_output, substrate_pool, narwhal_pool).await {
+    if let Err(err) = process_certificate(store, rx_output, narwhal_pool).await {
         log::error!("Error in process_certificate: {:?}", err);
     }
 
@@ -370,22 +339,17 @@ pub async fn process_transaction(transaction: Vec<u8>, client_addr: SocketAddr) 
     transport.send(Bytes::from(transaction)).await?;
 
     // TODO: Avoid Unnecessary Blocking - Remove it or consider consider a rate-limiting mechanism (e.g., tokio::time::Interval)
-    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
     Ok(())
 }
 
 // Submits processed transaction extracted from the certificate payload into the custom pool narwhal_pool
-pub async fn process_certificate<B, TP>(
+pub async fn process_certificate(
     mut store: Store,
     mut rx_certificate: Receiver<Certificate>,
-    substrate_pool: Arc<TP>,
     narwhal_pool: Arc<LocalPool>,
-) -> Result<()>
-where
-    B: BlockT<Extrinsic = OpaqueExtrinsic> + 'static,
-    TP: TransactionPool<Block = B> + 'static,
-{
+) -> Result<()> {
     log::warn!("Processing certificates...");
     while let Some(certificate) = rx_certificate.recv().await {
         log::debug!("Certificate: {:?}", certificate);
@@ -402,22 +366,15 @@ where
                 match bincode::deserialize(&value) {
                     Ok(worker::worker::WorkerMessage::Batch(batch)) => {
                         log::warn!("BATCH: {:?}", batch);
-                        for tx in batch {
-                            log::warn!("DriveTx'ing - raw tx: {:?}", tx);
-                            // Deserialize tx into TxHash
-                            match serde_json::from_slice::<TxHash<TP>>(&tx) {
-                                Ok(tx_hash) => {
-                                    log::warn!("DriveTx'ing - deserialize tx HASH: {:?}", tx_hash);
-                                    if let Some(certified_tx) =
-                                        substrate_pool.ready_transaction(&tx_hash)
-                                    {
-                                        let tx_data = certified_tx.data().clone();
-                                        log::warn!("DriveTx'ing - tx_data: {:?}", tx_data);
-                                        // Import ordered and certified txn for block sealing
-                                        narwhal_pool.import(tx_data);
-                                    } else {
-                                        log::warn!("Transaction not ready: {:?}", tx);
-                                    }
+                        for raw_tx in batch {
+                            // Deserialize tx into OpaqueExtrinsic
+                            match serde_json::from_slice::<OpaqueExtrinsic>(&raw_tx) {
+                                Ok(transaction) => {
+                                    log::warn!(
+                                        "DriveTx'ing - deserialize transaction: {:?}",
+                                        transaction
+                                    );
+                                    narwhal_pool.import(transaction);
                                 }
                                 Err(err) => {
                                     log::error!("Failed to deserialize transaction: {:?}", err);
@@ -546,7 +503,8 @@ where
 
         for inherent in inherents {
             match block_builder.push(inherent.clone()) {
-                Ok(()) => log::warn!("Inherent Applied: {:?}", inherent),
+                Ok(()) => (),
+                // log::warn!("Inherent Applied: {:?}", inherent),
                 Err(e) => log::error!("Error applying inherent: {:?} - {:?}", inherent, e),
             }
         }

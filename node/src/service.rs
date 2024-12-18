@@ -127,6 +127,12 @@ pub fn new_full<Network: sc_network::NetworkBackend<Block, <Block as BlockT>::Ha
         ..
     } = new_partial(&config)?;
 
+    let narwhal_config = narwhal_consensus::ConfigPaths {
+        keypair: n_keys,
+        committee: n_committee,
+        store: n_store,
+    };
+
     let net_config = sc_network::config::FullNetworkConfiguration::<
         Block,
         <Block as BlockT>::Hash,
@@ -180,11 +186,14 @@ pub fn new_full<Network: sc_network::NetworkBackend<Block, <Block as BlockT>::Ha
     let rpc_extensions_builder = {
         let client = client.clone();
         let pool = transaction_pool.clone();
+        let config = narwhal_config.clone();
 
         Box::new(move |_| {
-            let deps = crate::rpc::FullDeps {
+            let deps = crate::rpc::FullDeps::<Block, _, _> {
                 client: client.clone(),
                 pool: pool.clone(),
+                narwhal_config: config.clone(),
+                _marker: Default::default(),
             };
             crate::rpc::create_full(deps).map_err(Into::into)
         })
@@ -206,13 +215,10 @@ pub fn new_full<Network: sc_network::NetworkBackend<Block, <Block as BlockT>::Ha
     })?;
 
     let params = narwhal_consensus::NarwhalParams {
-        pool: transaction_pool,
         block_import: client.clone(),
         select_chain,
         client,
-        n_keys,
-        n_committee,
-        n_store,
+        config: narwhal_config,
         _phantom: std::marker::PhantomData,
     };
 

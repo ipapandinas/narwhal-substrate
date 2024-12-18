@@ -24,27 +24,37 @@
 
 use jsonrpsee::RpcModule;
 use minimal_template_runtime::interface::{AccountId, Nonce, OpaqueBlock};
+use narwhal_consensus::{
+    rpc::{Dag, DagApiServer},
+    ConfigPaths,
+};
 use polkadot_sdk::{
     sc_transaction_pool_api::TransactionPool,
     sp_blockchain::{Error as BlockChainError, HeaderBackend, HeaderMetadata},
+    sp_runtime::{traits::Block as BlockT, OpaqueExtrinsic},
     *,
 };
 use std::sync::Arc;
 
 /// Full client dependencies.
-pub struct FullDeps<C, P> {
+pub struct FullDeps<B, C, P> {
     /// The client instance to use.
     pub client: Arc<C>,
     /// Transaction pool instance.
     pub pool: Arc<P>,
+    /// Narwhal Config Paths.
+    pub narwhal_config: ConfigPaths,
+    /// Marker for Block generic type.
+    pub _marker: std::marker::PhantomData<B>,
 }
 
 #[docify::export]
 /// Instantiate all full RPC extensions.
-pub fn create_full<C, P>(
-    deps: FullDeps<C, P>,
+pub fn create_full<B, C, P>(
+    deps: FullDeps<B, C, P>,
 ) -> Result<RpcModule<()>, Box<dyn std::error::Error + Send + Sync>>
 where
+    B: BlockT<Extrinsic = OpaqueExtrinsic>,
     C: Send
         + Sync
         + 'static
@@ -58,9 +68,15 @@ where
 {
     use polkadot_sdk::substrate_frame_rpc_system::{System, SystemApiServer};
     let mut module = RpcModule::new(());
-    let FullDeps { client, pool } = deps;
+    let FullDeps {
+        client,
+        pool,
+        narwhal_config,
+        _marker,
+    } = deps;
 
     module.merge(System::new(client.clone(), pool.clone()).into_rpc())?;
+    module.merge(Dag::<B>::new(narwhal_config).into_rpc())?;
 
     Ok(module)
 }
